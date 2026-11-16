@@ -182,17 +182,34 @@ function render() {
     })
     .join("");
 
-  // 追蹤清單
-  $("#pending").innerHTML = st.pending.length
-    ? st.pending
-        .map(
-          (p) => `<div class="card pend"><div>
-            <a href="${esc(st.config.base_url)}/products/${encodeURIComponent(p.slug)}" target="_blank" rel="noopener">${esc(p.slug)}</a>
-            <div class="muted small">${p.manual ? "手動追蹤 · " : ""}自 ${fmtTime(p.since)}</div></div>
-            <button class="x" data-del="${esc(p.slug)}" aria-label="移除">✕</button></div>`,
-        )
-        .join("")
-    : `<div class="muted small center">目前沒有追蹤中的商品</div>`;
+  // 關鍵字與追蹤清單
+  const watchKws = st.watchKeywords || [];
+  const buyKws = (st.config.buy?.keywords || []).filter(
+    (bk) => !watchKws.some((wk) => wk.toLowerCase() === bk.toLowerCase()),
+  );
+  const kwCards = [
+    ...watchKws.map(
+      (kw) => `<div class="card pend"><div>
+        <div class="name">🎯 標題關鍵字:${esc(kw)}</div>
+        <div class="muted small">每次掃描全站搜尋標題(既有與新商品皆會比對)</div></div>
+        <button class="x" data-del-kw="${esc(kw)}" aria-label="移除">✕</button></div>`,
+    ),
+    ...buyKws.map(
+      (kw) => `<div class="card pend"><div>
+        <div class="name">🎯 標題關鍵字:${esc(kw)}</div>
+        <div class="muted small">來自「設定 → 下單關鍵字」(全站搜尋標題)</div></div></div>`,
+    ),
+  ];
+  const pendCards = st.pending.map(
+    (p) => `<div class="card pend"><div>
+      <a href="${esc(st.config.base_url)}/products/${encodeURIComponent(p.slug)}" target="_blank" rel="noopener">${esc(p.slug)}</a>
+      <div class="muted small">${p.manual ? "指定追蹤 · " : "等補貨 · "}自 ${fmtTime(p.since)}</div></div>
+      <button class="x" data-del="${esc(p.slug)}" aria-label="移除">✕</button></div>`,
+  );
+  const allTrack = [...kwCards, ...pendCards];
+  $("#pending").innerHTML = allTrack.length
+    ? allTrack.join("")
+    : `<div class="muted small center">目前沒有關鍵字或追蹤中的商品</div>`;
   $("#meta").textContent = `已記錄 ${st.knownCount} 件既有商品`;
 
   // 日誌
@@ -306,12 +323,19 @@ $("#watchForm").onsubmit = (e) => {
   run(e.submitter || $("#watchForm button"), async () => {
     const r = await api("/watch", "POST", { input });
     $("#watchInput").value = "";
-    toast(`已加入追蹤:${r.slug},下次掃描時檢查`);
+    toast(r.kind === "keyword" ? `已加入關鍵字「${r.value}」,下次掃描全站比對標題` : `已加入商品追蹤:${r.value},下次掃描檢查`);
     await refresh();
   });
 };
 
 $("#pending").addEventListener("click", (e) => {
+  const kw = e.target.dataset?.delKw;
+  if (kw !== undefined) {
+    return run(e.target, async () => {
+      await api("/watch-keyword/" + encodeURIComponent(kw), "DELETE");
+      await refresh();
+    });
+  }
   const slug = e.target.dataset?.del;
   if (!slug) return;
   run(e.target, async () => {

@@ -80,6 +80,27 @@ async function scanSource(base, src) {
   }
 }
 
+async function searchKeyword(base, keyword) {
+  const t0 = Date.now();
+  try {
+    const url = `${base.replace(/\/+$/, "")}/search?q=${encodeURIComponent(keyword)}`;
+    const { resp, text } = await fetchText(url, 12_000);
+    const blocked = resp.ok && looksBlocked(resp, text);
+    if (!resp.ok || blocked) {
+      return {
+        keyword,
+        ok: false,
+        status: resp.status,
+        ms: Date.now() - t0,
+        error: blocked ? "被 Cloudflare 驗證頁擋下" : `HTTP ${resp.status}`,
+      };
+    }
+    return { keyword, ok: true, status: resp.status, ms: Date.now() - t0, slugs: [...extractSlugs(text)] };
+  } catch (e) {
+    return { keyword, ok: false, ms: Date.now() - t0, error: e.name === "TimeoutError" ? "連線逾時" : String(e.message || e) };
+  }
+}
+
 async function checkProduct(base, slug, first) {
   try {
     const p = await fetchProduct(base, slug);
@@ -128,8 +149,10 @@ async function runOnce() {
   }
 
   const base = plan.config.base_url;
-  const [srcRes, prodRes] = await Promise.all([
+  const kws = plan.keywords || [];
+  const [srcRes, kwRes, prodRes] = await Promise.all([
     Promise.all(plan.config.sources.map((s) => scanSource(base, s))),
+    Promise.all(kws.map((kw) => searchKeyword(base, kw))),
     Promise.all((plan.pending || []).map((s) => checkProduct(base, s, false))),
   ]);
 
@@ -137,15 +160,19 @@ async function runOnce() {
     if (r.ok) log(`[${r.name}] 讀到 ${r.slugs.length} 件商品 (${r.ms}ms)`);
     else log(`[${r.name}] 失敗:${r.error}`);
   }
+  for (const r of kwRes) {
+    if (r.ok) log(`[關鍵字:${r.keyword}] 搜到 ${r.slugs.length} 件商品 (${r.ms}ms)`);
+    else log(`[關鍵字:${r.keyword}] 失敗:${r.error}`);
+  }
   if (prodRes.length) log(`檢查追蹤清單 ${prodRes.length} 件商品`);
 
-  let payload = { buyer: buyerInfo, sources: srcRes, products: prodRes };
+  let payload = { buyer: buyerInfo, sources: srcRes, searches: kwRes, products: prodRes };
   for (let round = 0; round < 3; round++) {
     const res = await report(payload);
     if (!res || !res.need?.length) break;
-    log(`發現新商品網址 ${res.need.length} 件:${res.need.join(", ")},抓取商品頁…`);
+    log(`檢查商品頁 ${res.need.length} 件:${res.need.join(", ")}…`);
     const followProducts = await Promise.all(res.need.map((s) => checkProduct(res.config.base_url, s, true)));
-    payload = { buyer: buyerInfo, sources: [], products: followProducts };
+    payload = { buyer: buyerInfo, sources: [], searches: [], products: followProducts };
   }
   log("本輪掃描完成");
 }
@@ -204,6 +231,7 @@ async function runLoop() {
   log(plan.enabled ? "控制台狀態:監控中" : "控制台狀態:已停止(等待在手機按「開始監控」)");
 
   const nextSrc = {};
+  let nextKw = 0;
   let nextPending = 0;
   let lastReport = Date.now();
   let lastKeepalive = Date.now();
@@ -211,7 +239,7 @@ async function runLoop() {
 
   while (Date.now() < deadline) {
     const now = Date.now();
-    const payload = { buyer: buyerStatus(), notices: notices.splice(0), sources: [], products: [], orders: [] };
+    const payload = { buyer: buyerStatus(), notices: notices.splice(0), sources: [], searches: [], products: [], orders: [] };
     const base = plan.config.base_url;
 
     if (plan.enabled !== wasEnabled) {
@@ -222,15 +250,21 @@ async function runLoop() {
     if (plan.enabled) {
       const due = plan.config.sources.filter((s) => now >= (nextSrc[s.name] ?? 0));
       for (const s of due) nextSrc[s.name] = now + Math.max(3, s.interval) * 1000;
+      const kwInterval = Math.max(5, Math.min(...(plan.config.sources.map((s) => s.interval) || [10])));
+      const kws = (plan.keywords || []).length && now >= nextKw ? plan.keywords : [];
+      if (kws.length) nextKw = now + kwInterval * 1000;
       const pend = plan.pending.length && now >= nextPending ? plan.pending : [];
       if (pend.length) nextPending = now + Math.max(2, plan.config.pending_interval) * 1000;
-      const [srcRes, prodRes] = await Promise.all([
+      const [srcRes, kwRes, prodRes] = await Promise.all([
         Promise.all(due.map((s) => scanSource(base, s))),
+        Promise.all(kws.map((kw) => searchKeyword(base, kw))),
         Promise.all(pend.map((s) => checkProduct(base, s, false))),
       ]);
       payload.sources = srcRes;
+      payload.searches = kwRes;
       payload.products = prodRes;
       for (const r of srcRes) if (!r.ok) log(`[${r.name}] ${r.error}`);
+      for (const r of kwRes) if (!r.ok) log(`[關鍵字:${r.keyword}] ${r.error}`);
     }
 
     if (buyer?.ready && now - lastKeepalive > KEEPALIVE_MS) {
@@ -240,7 +274,7 @@ async function runLoop() {
       if (before && !buyer.status().ok) payload.notices.push(buyer.status().msg);
     }
 
-    const hasData = payload.sources.length || payload.products.length || payload.notices.length;
+    const hasData = payload.sources.length || payload.searches.length || payload.products.length || payload.notices.length;
     if (!hasData && now - lastReport < HEARTBEAT_MS) {
       await sleep(plan.enabled ? 300 : 2000);
       continue;
@@ -261,11 +295,11 @@ async function runLoop() {
         }
       }
       if (plan.need?.length) {
-        log(`新商品網址 ${plan.need.length} 件:${plan.need.join(", ")}`);
+        log(`檢查商品頁 ${plan.need.length} 件:${plan.need.join(", ")}`);
         follow.products = await Promise.all(plan.need.map((s) => checkProduct(plan.config.base_url, s, true)));
       }
       if (!follow.orders.length && !follow.products.length) break;
-      Object.assign(payload, follow, { sources: [] });
+      Object.assign(payload, follow, { sources: [], searches: [] });
     }
   }
 

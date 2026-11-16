@@ -35,6 +35,7 @@ export class Monitor extends DurableObject {
         enabled: false,
         baselined: {},
         pending: {},
+        watchKeywords: [],
         announced: {},
         logs: [],
         src: {},
@@ -43,6 +44,7 @@ export class Monitor extends DurableObject {
         ...saved,
       };
       this.s.config = withDefaults(saved.config);
+      this.s.watchKeywords = arr(this.s.watchKeywords).map((k) => str(k, 80).trim()).filter(Boolean);
       this.s.orders ||= { count: 0, items: {} };
       this.s.src ||= {};
       this.known = new Set(saved.known || []);
@@ -159,7 +161,34 @@ export class Monitor extends DurableObject {
     await this.notify(headline, body);
   }
 
-  // ---------------------------------------------------------------- 自動下單判斷
+  // ---------------------------------------------------------------- 關鍵字與自動下單判斷
+  /** 目前要全站搜尋標題的所有關鍵字(手動追蹤關鍵字 + 下單關鍵字,不分大小寫去重)。 */
+  activeKeywords() {
+    const out = [];
+    const seen = new Set();
+    for (const k of [...arr(this.s.watchKeywords), ...arr(this.s.config.buy?.keywords)]) {
+      const s = String(k || "").trim();
+      if (!s) continue;
+      const low = s.toLowerCase();
+      if (seen.has(low)) continue;
+      seen.add(low);
+      out.push(s);
+    }
+    return out.slice(0, 15);
+  }
+
+  /** 若商品標題命中任一目標關鍵字(且不含排除關鍵字),回傳該關鍵字;否則 null。 */
+  keywordHit(p) {
+    const ex = this.s.config.match.exclude_keywords || [];
+    const name = p.name.toLowerCase();
+    if (ex.some((k) => name.includes(k.toLowerCase()))) return null;
+    for (const kw of this.activeKeywords()) {
+      const k = kw.toLowerCase();
+      if (name.includes(k) || p.slug.toLowerCase() === k) return kw;
+    }
+    return null;
+  }
+
   /** 回傳命中的下單關鍵字;不下單則回傳 null。 */
   buyKeyword(p) {
     const b = this.s.config.buy;
@@ -177,6 +206,11 @@ export class Monitor extends DurableObject {
   async queueBuy(p, kw, buys) {
     const b = this.s.config.buy;
     if (!this.pollerOnline() || !this.s.poller?.buyer) {
+      // 純雲端排程模式本來就沒有電腦瀏覽器,直接由商品有貨通知提供連結即可,不重複發錯誤通知
+      if (this.s.poller?.mode === "cron") {
+        this.log("info", `命中關鍵字「${kw}」(雲端模式僅推播商品連結,不自動刷卡)`);
+        return;
+      }
       await this.notify("⚠ 符合下單條件,但 電腦上的下單程式未就緒", `${p.name}\n請手動結帳:${productUrl(this.s.config.base_url, p.slug)}`, "warn");
       return;
     }
@@ -224,7 +258,8 @@ export class Monitor extends DurableObject {
       this.track(slug);
       return;
     }
-    if (!manual && !matches(cfg, p)) {
+    const kwHit = this.keywordHit(p);
+    if (!manual && !kwHit && !matches(cfg, p)) {
       this.untrack(slug);
       this.markDone(slug);
       return;
@@ -239,9 +274,13 @@ export class Monitor extends DurableObject {
     if (p.inStock) {
       const head = manual
         ? "🔥 追蹤的商品有貨了"
-        : this.s.announced[slug]
-          ? "🔥 陀螺補貨 / 開賣了"
-          : "🔥 新陀螺上架(有貨)";
+        : kwHit
+          ? this.s.announced[slug]
+            ? `🔥 命中關鍵字「${kwHit}」補貨了`
+            : `🎯 命中關鍵字「${kwHit}」(有貨)`
+          : this.s.announced[slug]
+            ? "🔥 陀螺補貨 / 開賣了"
+            : "🔥 新陀螺上架(有貨)";
       // 先排下單再通知,搶時間
       const kw = this.buyKeyword(p);
       if (kw) await this.queueBuy(p, kw, buys);
@@ -249,8 +288,27 @@ export class Monitor extends DurableObject {
       this.untrack(slug);
       this.markDone(slug);
     } else {
-      await this.announce(slug, "listed", "🆕 新陀螺上架(目前缺貨,持續追蹤補貨)", p);
-      this.track(slug);
+      const head = kwHit
+        ? `🆕 命中關鍵字「${kwHit}」(目前缺貨,持續追蹤補貨)`
+        : "🆕 新陀螺上架(目前缺貨,持續追蹤補貨)";
+      await this.announce(slug, "listed", head, p);
+      this.track(slug, !!kwHit || manual);
+    }
+  }
+
+  /** 關鍵字全站搜尋結果。r = { keyword, ok, status, ms, slugs?, error? };連既有商品也會檢查標題。 */
+  applySearch(r, need) {
+    const kw = str(r.keyword, 80).trim();
+    if (!kw) return;
+    if (!r.ok) {
+      this.log("warn", `[關鍵字:${kw}] 搜尋失敗:${str(r.error || `HTTP ${r.status}`)}`);
+      return;
+    }
+    const slugs = arr(r.slugs).slice(0, 50).map((s) => slugOf(str(s, 300))).filter(Boolean);
+    for (const s of slugs) {
+      if (!this.done.has(s) && !(s in this.s.pending)) {
+        need.add(s);
+      }
     }
   }
 
@@ -325,6 +383,7 @@ export class Monitor extends DurableObject {
     const need = new Set();
     if (this.s.enabled) {
       for (const r of arr(b.sources).slice(0, 10)) this.applySource(r, need);
+      for (const r of arr(b.searches).slice(0, 15)) this.applySearch(r, need);
       // 商品逐一處理(依序,避免同一商品重複下單)
       for (const r of arr(b.products).slice(0, 40)) await this.applyProduct(r, buys);
 
@@ -348,6 +407,7 @@ export class Monitor extends DurableObject {
         pending_interval: cfg.pending.interval,
         buy_enabled: cfg.buy.enabled,
       },
+      keywords: this.activeKeywords(),
       need: [...need].slice(0, MAX_NEED),
       pending: Object.entries(this.s.pending)
         .sort((a, b) => a[1].t - b[1].t)
@@ -390,6 +450,9 @@ export class Monitor extends DurableObject {
       const names = new Set(cfg.sources.map((s) => s.name));
       for (const n of Object.keys(this.s.baselined)) if (!names.has(n)) delete this.s.baselined[n];
       for (const n of Object.keys(this.s.src)) if (!names.has(n)) delete this.s.src[n];
+      for (const s of [...this.done]) {
+        if (this.s.announced[s] !== "stock") this.done.delete(s);
+      }
       this.log("info", "設定已更新");
       if (cfg.buy.live && !prevBuy.live) this.log("warn", "⚠ 已切換為「正式下單」模式");
       await this.save();
@@ -397,14 +460,38 @@ export class Monitor extends DurableObject {
     }
 
     if (method === "POST" && path === "/watch") {
-      const slug = slugOf(String(body.input || "").trim());
-      if (!slug || /\s/.test(slug)) return json({ error: "請輸入商品網址或代碼" }, 400);
-      this.done.delete(slug);
-      delete this.s.announced[slug];
-      this.track(slug, true);
-      this.log("info", `手動加入追蹤:${slug}(下次掃描時檢查)`);
+      const raw = String(body.input || "").trim();
+      if (!raw) return json({ error: "請輸入商品標題關鍵字、網址或編號" }, 400);
+      const isUrl = raw.includes("/products/");
+      const isSku = !isUrl && /^[a-z]{2,4}\d{4,6}[a-z0-9]*$/i.test(raw);
+      if (isUrl || isSku) {
+        const slug = slugOf(raw);
+        if (!slug || /\s/.test(slug)) return json({ error: "商品網址或編號格式不正確" }, 400);
+        this.done.delete(slug);
+        delete this.s.announced[slug];
+        this.track(slug, true);
+        this.log("info", `手動加入商品追蹤:${slug}(下次掃描時檢查)`);
+        await this.save();
+        return json({ ok: true, kind: "slug", slug, value: slug });
+      }
+      const kw = raw.slice(0, 80);
+      if (!this.s.watchKeywords.some((k) => k.toLowerCase() === kw.toLowerCase())) {
+        this.s.watchKeywords.push(kw);
+      }
+      for (const s of [...this.done]) {
+        if (this.s.announced[s] !== "stock") this.done.delete(s);
+      }
+      this.log("info", `加入關鍵字追蹤:「${kw}」(下次掃描時全站搜尋商品標題)`);
       await this.save();
-      return json({ ok: true, slug });
+      return json({ ok: true, kind: "keyword", slug: kw, value: kw });
+    }
+
+    if (method === "DELETE" && path.startsWith("/watch-keyword/")) {
+      const kw = decodeURIComponent(path.slice("/watch-keyword/".length));
+      this.s.watchKeywords = this.s.watchKeywords.filter((k) => k.toLowerCase() !== kw.toLowerCase());
+      this.log("info", `移除關鍵字追蹤:「${kw}」`);
+      await this.save();
+      return json({ ok: true });
     }
 
     if (method === "DELETE" && path.startsWith("/pending/")) {
@@ -473,6 +560,8 @@ export class Monitor extends DurableObject {
       hasWebhook: !!(this.env.DISCORD_WEBHOOK || "").trim(),
       hasPollerToken: (this.env.POLLER_TOKEN || "").length >= 16,
       config: cfg,
+      watchKeywords: this.s.watchKeywords,
+      activeKeywords: this.activeKeywords(),
       sources: cfg.sources.map((s) => ({
         name: s.name,
         ...(this.s.src[s.name] || { scans: 0, ok: null, at: 0, ms: 0, count: 0, error: "" }),
