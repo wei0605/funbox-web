@@ -2,10 +2,9 @@ name: poll-funbox
 
 on:
   schedule:
-    - cron: "*/5 * * * *" # GitHub 最短每 5 分鐘一次(尖峰時段可能延遲數分鐘)
-  workflow_dispatch: # 可到 GitHub Actions 頁面點 Run workflow 立即測試
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
-# 同時間只跑一個,避免重複掃描與重複通知
 concurrency:
   group: poll-funbox
   cancel-in-progress: false
@@ -22,9 +21,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Scan Funbox and report to Cloudflare Worker
+      - name: Scan Funbox and report to Worker
         run: node poller/run.mjs --once
         env:
-          WORKER_URL: ${{ secrets.WORKER_URL || 'https://funbox-watch.s1688334.workers.dev' }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
           POLLER_TOKEN: ${{ secrets.POLLER_TOKEN || secrets.ADMIN_TOKEN }}
           BUY_ENABLED: "0"
