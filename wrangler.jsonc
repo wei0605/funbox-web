@@ -1,0 +1,14 @@
+{
+  "name": "funbox-watch",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-03-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "MONITOR", "class_name": "Monitor" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Monitor"] }],
+  "observability": { "enabled": true }
+}

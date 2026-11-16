@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Funbox 監控">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/style.css">
+  <title>Funbox 監控</title>
+</head>
+<body>
+  <!-- 登入 -->
+  <main id="login" class="screen hidden">
+    <div class="card login-card">
+      <h1>Funbox 監控</h1>
+      <p class="muted">輸入管理密碼(部署時設定的 ADMIN_TOKEN)</p>
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="管理密碼">
+      <button id="loginBtn" class="btn primary">登入</button>
+      <p id="loginErr" class="err"></p>
+    </div>
+  </main>
+
+  <!-- 主畫面 -->
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <h1>Funbox 監控</h1>
+      <span id="pill" class="pill">…</span>
+    </header>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- 監控 -->
+    <section id="tab-dash" class="tab">
+      <div id="warnings"></div>
+      <button id="toggleBtn" class="btn big">…</button>
+
+      <h2>監控來源</h2>
+      <div id="sources" class="stack"></div>
+
+      <h2>追蹤清單 <span class="muted small">(缺貨 / 未開放,有貨會通知)</span></h2>
+      <div id="pending" class="stack"></div>
+      <form id="watchForm" class="row">
+        <input id="watchInput" placeholder="貼上商品網址或代碼,手動追蹤" autocapitalize="off" autocorrect="off">
+        <button class="btn">追蹤</button>
+      </form>
+      <p id="meta" class="muted small center"></p>
+    </section>
+
+    <!-- 設定 -->
+    <section id="tab-settings" class="tab hidden">
+      <form id="settingsForm" class="stack">
+        <div class="card stack">
+          <h2>網站</h2>
+          <label>網站網址<input id="f_base" inputmode="url" autocapitalize="off"></label>
+        </div>
+
+        <div class="card stack">
+          <h2>監控來源</h2>
+          <p class="muted small">掃描商品列表頁,偵測新出現的商品網址。實際輪詢頻率由 GitHub Actions 決定(約每 5 分鐘一次),下方「間隔」只在改成連續輪詢模式時才有作用。</p>
+          <div id="f_sources" class="stack"></div>
+          <button type="button" id="addSource" class="btn">＋ 新增來源</button>
+        </div>
+
+        <div class="card stack">
+          <h2>商品條件</h2>
+          <p class="muted small">符合「任一」代碼前綴或「任一」名稱關鍵字,且不含排除關鍵字才處理。多個用逗號分隔。</p>
+          <label>代碼前綴<input id="f_prefix" placeholder="bb"></label>
+          <label>名稱關鍵字<input id="f_include" placeholder="戰鬥陀螺, BEYBLADE"></label>
+          <label>排除關鍵字<input id="f_exclude" placeholder="APP兌換"></label>
+        </div>
+
+        <div class="card stack">
+          <h2>補貨追蹤</h2>
+          <div class="row">
+            <label class="grow">檢查間隔(秒)<input id="f_pint" type="number" inputmode="numeric" min="2"></label>
+            <label class="grow">逾時放棄(分鐘)<input id="f_ptimeout" type="number" inputmode="numeric" min="1"></label>
+          </div>
+        </div>
+
+        <div class="card stack">
+          <h2>通知</h2>
+          <label>Discord 提及<input id="f_mention" placeholder="&lt;@你的ID&gt; 或 @everyone(可留空)" autocapitalize="off"></label>
+          <label>單價上限(0 = 不限)<input id="f_cap" type="number" inputmode="numeric" min="0"></label>
+          <label>購物車連結範本(可留空)
+            <input id="f_cart" placeholder="{base}/cart/{variant_id}:{qty}" autocapitalize="off">
+          </label>
+          <label>連結數量<input id="f_qty" type="number" inputmode="numeric" min="1"></label>
+          <p class="muted small">範本可用 {base} {variant_id} {qty}。留空時通知只附商品頁連結。需先確認這個網站支援網址加入購物車。</p>
+        </div>
+
+        <button class="btn primary" id="saveBtn">儲存設定</button>
+      </form>
+
+      <div class="card stack">
+        <h2>測試與維護</h2>
+        <button class="btn" id="testDiscord">傳送 Discord 測試通知</button>
+        <button class="btn danger" id="resetBtn">重設基準(清除已知商品)</button>
+        <button class="btn" id="logoutBtn">登出此裝置</button>
+      </div>
+    </section>
+
+    <!-- 日誌 -->
+    <section id="tab-logs" class="tab hidden">
+      <div class="row between"><h2>日誌</h2><button class="btn small-btn" id="clearLogs">清除</button></div>
+      <div id="logs" class="logs"></div>
+    </section>
+
+    <nav class="tabbar">
+      <button data-tab="dash" class="active">監控</button>
+      <button data-tab="settings">設定</button>
+      <button data-tab="logs">日誌</button>
+    </nav>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
