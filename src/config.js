@@ -22,6 +22,16 @@ export const DEFAULT_CONFIG = {
     cart_link_template: "", // 可用 {base} {variant_id} {qty};空白 = 只附商品頁連結
     cart_qty: 1,
   },
+  // 自動下單(由家裡電腦上的 poller 執行,用 FunboxSniper 的專屬 Chrome 與 card.dat)
+  buy: {
+    enabled: false, // 總開關
+    live: false, // false = 演練(走到結帳頁就停),true = 真的送出訂單
+    keywords: [], // 商品名稱含任一個才下單;留空 = 不下單
+    quantity: 1,
+    max_orders: 1, // 正式下單最多幾張,達到即停止
+    payment_keyword: "信用卡", // 付款方式按鈕文字(銀行簡訊驗證需本人在電腦上的 Chrome 完成)
+    shipping_keyword: "", // 運送方式按鈕文字,留空 = 網站預設
+  },
 };
 
 const clampInt = (v, lo, hi, dflt) => {
@@ -73,6 +83,7 @@ export function sanitizeConfig(input) {
   const m = input.match || {};
   const n = input.notify || {};
   const p = input.pending || {};
+  const b = input.buy || {};
   const template = String(n.cart_link_template || "").trim();
   if (template && !(template.startsWith("{base}") || template.startsWith("https://"))) {
     return { error: "購物車連結範本必須以 https:// 或 {base} 開頭" };
@@ -97,6 +108,28 @@ export function sanitizeConfig(input) {
         cart_link_template: template.slice(0, 300),
         cart_qty: clampInt(n.cart_qty, 1, 20, 1),
       },
+      buy: {
+        enabled: b.enabled === true,
+        live: b.live === true,
+        keywords: strList(b.keywords, 30),
+        quantity: clampInt(b.quantity, 1, 20, 1),
+        max_orders: clampInt(b.max_orders, 1, 20, 1),
+        payment_keyword: String(b.payment_keyword ?? "").trim().slice(0, 40),
+        shipping_keyword: String(b.shipping_keyword ?? "").trim().slice(0, 40),
+      },
     },
+  };
+}
+
+/** 舊版存檔沒有新欄位時補上預設值。 */
+export function withDefaults(cfg) {
+  const c = cfg || {};
+  return {
+    ...DEFAULT_CONFIG,
+    ...c,
+    match: { ...DEFAULT_CONFIG.match, ...c.match },
+    pending: { ...DEFAULT_CONFIG.pending, ...c.pending },
+    notify: { ...DEFAULT_CONFIG.notify, ...c.notify },
+    buy: { ...DEFAULT_CONFIG.buy, ...c.buy },
   };
 }

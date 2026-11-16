@@ -40,6 +40,9 @@
       <div id="warnings"></div>
       <button id="toggleBtn" class="btn big">…</button>
 
+      <h2>電腦偵測程式</h2>
+      <div id="poller" class="stack"></div>
+
       <h2>監控來源</h2>
       <div id="sources" class="stack"></div>
 
@@ -49,6 +52,8 @@
         <input id="watchInput" placeholder="貼上商品網址或代碼,手動追蹤" autocapitalize="off" autocorrect="off">
         <button class="btn">追蹤</button>
       </form>
+      <h2>自動下單紀錄</h2>
+      <div id="orders" class="stack"></div>
       <p id="meta" class="muted small center"></p>
     </section>
 
@@ -62,7 +67,7 @@
 
         <div class="card stack">
           <h2>監控來源</h2>
-          <p class="muted small">掃描商品列表頁,偵測新出現的商品網址。實際輪詢頻率由 GitHub Actions 決定(約每 5 分鐘一次),下方「間隔」只在改成連續輪詢模式時才有作用。</p>
+          <p class="muted small">掃描商品列表頁,偵測新出現的商品網址。由家裡電腦上的程式依「間隔」持續輪詢(最短 3 秒)。</p>
           <div id="f_sources" class="stack"></div>
           <button type="button" id="addSource" class="btn">＋ 新增來源</button>
         </div>
@@ -94,12 +99,27 @@
           <p class="muted small">範本可用 {base} {variant_id} {qty}。留空時通知只附商品頁連結。需先確認這個網站支援網址加入購物車。</p>
         </div>
 
+        <div class="card stack">
+          <h2>自動下單</h2>
+          <p class="muted small">有貨且名稱含「下單關鍵字」時,由家裡電腦上的程式在 FunboxSniper 的專屬 Chrome 加入購物車、自動填入信用卡並送出。銀行簡訊驗證需要您在那台電腦的 Chrome 輸入驗證碼(Discord 會通知)。</p>
+          <label class="check"><input type="checkbox" id="b_enabled"> 啟用自動下單</label>
+          <label class="check"><input type="checkbox" id="b_live"> 正式送出訂單(不勾 = 演練,只走到結帳頁)</label>
+          <label>下單關鍵字(逗號分隔,留空 = 不下單)<input id="b_kw" placeholder="例:BX-01, 天馬"></label>
+          <div class="row">
+            <label class="grow">每件數量<input id="b_qty" type="number" inputmode="numeric" min="1"></label>
+            <label class="grow">最多幾張訂單<input id="b_max" type="number" inputmode="numeric" min="1"></label>
+          </div>
+          <label>付款方式按鈕文字<input id="b_pay" placeholder="信用卡"></label>
+          <label>運送方式按鈕文字(留空 = 網站預設)<input id="b_ship" placeholder=""></label>
+        </div>
+
         <button class="btn primary" id="saveBtn">儲存設定</button>
       </form>
 
       <div class="card stack">
         <h2>測試與維護</h2>
         <button class="btn" id="testDiscord">傳送 Discord 測試通知</button>
+        <button class="btn" id="resetOrders">清除下單紀錄與計數</button>
         <button class="btn danger" id="resetBtn">重設基準(清除已知商品)</button>
         <button class="btn" id="logoutBtn">登出此裝置</button>
       </div>

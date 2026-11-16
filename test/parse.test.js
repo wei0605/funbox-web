@@ -65,3 +65,13 @@ test("sanitizeConfig 拒絕空來源、重複名稱與非 https", () => {
   e.base_url = "http://shop.funbox.com.tw";
   assert.ok(sanitizeConfig(e).error);
 });
+
+test("sanitizeConfig:自動下單設定預設關閉、數值有上下限", () => {
+  const { cfg } = sanitizeConfig({ ...DEFAULT_CONFIG, buy: { enabled: true, live: "yes", keywords: [" 天馬 ", ""], quantity: 99, max_orders: 0 } });
+  assert.equal(cfg.buy.enabled, true);
+  assert.equal(cfg.buy.live, false); // 只有 true 才算正式下單
+  assert.deepEqual(cfg.buy.keywords, ["天馬"]);
+  assert.equal(cfg.buy.quantity, 20);
+  assert.equal(cfg.buy.max_orders, 1);
+  assert.equal(sanitizeConfig(DEFAULT_CONFIG).cfg.buy.enabled, false);
+});

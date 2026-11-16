@@ -1,0 +1,9 @@
+{
+  "name": "funbox-poller",
+  "private": true,
+  "type": "module",
+  "description": "在家裡電腦抓 Funbox 網頁並回報給 Cloudflare Worker;連接專屬 Chrome 自動下單",
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

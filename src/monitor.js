@@ -1,17 +1,17 @@
-// Durable Object:保存狀態,接收外部輪詢程式(GitHub Actions)回報的資料,
-// 判斷新品 / 補貨並發 Discord 通知。邏輯移植自 funbox-sniper 的「僅通知」模式。
-//
-// 為什麼不在 Worker 裡直接抓 Funbox:Funbox 會對 Cloudflare Workers 回 403,
-// 所以「抓網頁」放到 poller/run.mjs(跑在 GitHub Actions),這裡只做判斷與通知。
+// Durable Object:監控的「大腦」。
+// Funbox 會擋 Cloudflare Workers,所以「抓網頁」改由家裡電腦上的 poller/run.mjs 執行,
+// 結果透過 POST /api/report 送進來;這裡負責判斷新品、追蹤補貨、Discord 通知、決定是否自動下單。
+// 判斷邏輯移植自 funbox-sniper(detector.py + main.py)。
 import { DurableObject } from "cloudflare:workers";
-import { DEFAULT_CONFIG, sanitizeConfig } from "./config.js";
-import { matches, prefixOk, productUrl, slugOf } from "./parse.js";
+import { sanitizeConfig, withDefaults } from "./config.js";
+import { extractSlugs, fetchText, looksBlocked, matches, prefixOk, productUrl, slugOf } from "./parse.js";
 
 const MAX_LOGS = 150;
 const MAX_KNOWN = 5000;
 const MAX_DONE = 500;
-const MAX_FETCH_PER_RUN = 30; // 每輪最多請輪詢程式抓幾個商品頁
-const MAX_SLUGS_PER_SOURCE = 3000;
+const MAX_NEED = 15; // 每次回報最多要求抓幾個新商品頁
+const MAX_PENDING = 15; // 每次最多檢查幾個追蹤中的商品
+const POLLER_STALE_MS = 90_000; // 超過這麼久沒回報就視為離線
 const STAGE_ORDER = { url: 0, listed: 1, stock: 2 };
 
 const json = (data, status = 200) =>
@@ -20,10 +20,9 @@ const json = (data, status = 200) =>
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 
-const twTime = () =>
-  new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false });
-
-const str = (v, max) => String(v ?? "").slice(0, max);
+const twTime = () => new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false });
+const arr = (v) => (Array.isArray(v) ? v : []);
+const str = (v, n = 200) => String(v ?? "").slice(0, n);
 
 export class Monitor extends DurableObject {
   constructor(ctx, env) {
@@ -33,30 +32,32 @@ export class Monitor extends DurableObject {
       const saved = (await this.ctx.storage.get("state")) || {};
       this.s = {
         enabled: false,
-        config: DEFAULT_CONFIG,
         baselined: {},
         pending: {},
         announced: {},
-        src: {}, // 各來源最近一次回報狀態
-        lastIngestAt: 0,
         logs: [],
+        src: {},
+        poller: null,
+        orders: { count: 0, items: {} },
         ...saved,
       };
+      this.s.config = withDefaults(saved.config);
+      this.s.orders ||= { count: 0, items: {} };
+      this.s.src ||= {};
       this.known = new Set(saved.known || []);
       this.done = new Set(saved.done || []);
-      await this.ctx.storage.deleteAlarm(); // 清除舊版(自己輪詢)留下的排程
     });
+    // 舊版用 alarm 自己抓網頁,已停用
+    this.ctx.storage.deleteAlarm().catch(() => {});
   }
 
   // ---------------------------------------------------------------- 狀態
   async save() {
     while (this.known.size > MAX_KNOWN) this.known.delete(this.known.values().next().value);
     while (this.done.size > MAX_DONE) this.done.delete(this.done.values().next().value);
-    await this.ctx.storage.put("state", {
-      ...this.s,
-      known: [...this.known],
-      done: [...this.done],
-    });
+    const items = Object.entries(this.s.orders.items);
+    if (items.length > 200) this.s.orders.items = Object.fromEntries(items.slice(-200));
+    await this.ctx.storage.put("state", { ...this.s, known: [...this.known], done: [...this.done] });
     this.dirty = false;
   }
 
@@ -68,13 +69,9 @@ export class Monitor extends DurableObject {
 
   track(slug, manual = false) {
     const cur = this.s.pending[slug];
-    if (!cur) {
-      this.s.pending[slug] = { t: Date.now(), manual };
-      this.dirty = true;
-    } else if (manual && !cur.manual) {
-      cur.manual = true;
-      this.dirty = true;
-    }
+    if (!cur) this.s.pending[slug] = { t: Date.now(), manual };
+    else if (manual) cur.manual = true;
+    this.dirty = true;
   }
 
   untrack(slug) {
@@ -87,6 +84,10 @@ export class Monitor extends DurableObject {
   markDone(slug) {
     this.done.add(slug);
     this.dirty = true;
+  }
+
+  pollerOnline() {
+    return !!this.s.poller && Date.now() - this.s.poller.at < POLLER_STALE_MS;
   }
 
   // ---------------------------------------------------------------- 通知
@@ -121,6 +122,12 @@ export class Monitor extends DurableObject {
     return { ok: false, error: "Discord 限流" };
   }
 
+  async notify(headline, body, level = "notify") {
+    const r = await this.sendDiscord(`**${headline}**\n${body}\n_${twTime()}_`);
+    const first = body.split("\n")[0];
+    this.log(r.ok ? level : "error", `${headline} ${first}${r.ok ? "" : `(Discord 失敗:${r.error})`}`);
+  }
+
   /** 每個商品每個階段只通知一次。 */
   async announce(slug, stage, headline, p = null) {
     const prev = this.s.announced[slug];
@@ -144,22 +151,71 @@ export class Monitor extends DurableObject {
         body += `\n🛒 加入購物車:${link}`;
       }
     }
-    const r = await this.sendDiscord(`**${headline}**\n${body}\n_${twTime()}_`);
-    this.log(r.ok ? "notify" : "error", `${headline} ${slug}${r.ok ? "" : `(Discord 失敗:${r.error})`}`);
+    await this.notify(headline, body);
   }
 
-  // ---------------------------------------------------------------- 商品評估
-  /** p 是輪詢程式抓回來並解析好的商品資料。 */
-  async evaluate(slug, p) {
-    if (this.done.has(slug)) return;
-    const cfg = this.s.config;
-    const manual = !!this.s.pending[slug]?.manual;
+  // ---------------------------------------------------------------- 自動下單判斷
+  /** 回傳命中的下單關鍵字;不下單則回傳 null。 */
+  buyKeyword(p) {
+    const b = this.s.config.buy;
+    if (!b.enabled || !p.variantId || this.s.orders.items[p.slug]) return null;
+    const name = p.name.toLowerCase();
+    const kw = b.keywords.find((k) => name.includes(k.toLowerCase()));
+    if (!kw) return null;
+    if (b.live && this.s.orders.count >= b.max_orders) {
+      this.log("warn", `已達下單上限 ${b.max_orders} 張,不再自動下單:${p.slug}`);
+      return null;
+    }
+    return kw;
+  }
 
+  async queueBuy(p, kw, buys) {
+    const b = this.s.config.buy;
+    if (!this.pollerOnline() || !this.s.poller?.buyer) {
+      await this.notify("⚠ 符合下單條件,但 電腦上的下單程式未就緒", `${p.name}\n請手動結帳:${productUrl(this.s.config.base_url, p.slug)}`, "warn");
+      return;
+    }
+    this.s.orders.items[p.slug] = { t: Date.now(), state: "sent", live: b.live, name: p.name };
+    this.dirty = true;
+    buys.push({
+      slug: p.slug,
+      variantId: p.variantId,
+      name: p.name,
+      qty: b.quantity,
+      live: b.live,
+      payment_keyword: b.payment_keyword,
+      shipping_keyword: b.shipping_keyword,
+    });
+    await this.notify(
+      b.live ? "🛒 開始自動下單" : "🧪 開始演練下單(不會送出)",
+      `${p.name}\n命中關鍵字:${kw}\n${productUrl(this.s.config.base_url, p.slug)}`,
+    );
+  }
+
+  // ---------------------------------------------------------------- 處理回報
+  /** 商品頁結果。res = { slug, first, ok, product?, error? } */
+  async applyProduct(res, buys) {
+    const slug = slugOf(str(res.slug, 300));
+    if (!slug || this.done.has(slug)) return;
+    const cfg = this.s.config;
+    const first = !!res.first;
+    const manual = !!this.s.pending[slug]?.manual;
+    if (!res.ok) {
+      this.log("warn", `讀取商品 ${slug} 失敗:${str(res.error)}`);
+      this.track(slug);
+      return;
+    }
+    const r = res.product || {};
+    const p = {
+      slug,
+      name: str(r.name, 200),
+      price: Number(r.price) || 0,
+      variantId: r.variantId ?? null,
+      exists: r.exists !== false,
+      inStock: !!r.inStock,
+    };
     if (!p.exists) {
-      // 網址剛出現但頁面尚未開放:持續追蹤
-      if (!manual && prefixOk(cfg, slug)) {
-        await this.announce(slug, "url", "🆕 發現新陀螺網址(頁面尚未開放)");
-      }
+      if (first && prefixOk(cfg, slug)) await this.announce(slug, "url", "🆕 發現新陀螺網址(頁面尚未開放)");
       this.track(slug);
       return;
     }
@@ -181,6 +237,9 @@ export class Monitor extends DurableObject {
         : this.s.announced[slug]
           ? "🔥 陀螺補貨 / 開賣了"
           : "🔥 新陀螺上架(有貨)";
+      // 先排下單再通知,搶時間
+      const kw = this.buyKeyword(p);
+      if (kw) await this.queueBuy(p, kw, buys);
       await this.announce(slug, "stock", head, p);
       this.untrack(slug);
       this.markDone(slug);
@@ -190,117 +249,104 @@ export class Monitor extends DurableObject {
     }
   }
 
-  // ---------------------------------------------------------------- 輪詢程式的介面
-  /** 輪詢程式一開始先問:要不要做事、抓哪些來源、有哪些追蹤中的商品。 */
-  pollPlan() {
+  /** 列表頁結果。r = { name, ok, status, ms, slugs?, error? };新網址放進 need。 */
+  applySource(r, need) {
     const cfg = this.s.config;
-    const now = Date.now();
-    for (const [slug, v] of Object.entries(this.s.pending)) {
-      if (now - v.t > cfg.pending.timeout_minutes * 60_000) {
-        this.log("info", `追蹤逾時,放棄 ${slug}`);
-        this.untrack(slug);
-      }
+    const name = str(r.name, 60);
+    if (!cfg.sources.some((s) => s.name === name)) return;
+    const st = (this.s.src[name] ||= { scans: 0, ok: null, at: 0, ms: 0, count: 0, error: "" });
+    st.at = Date.now();
+    st.ms = Number(r.ms) || 0;
+    this.dirty = true;
+    const slugs = new Set(arr(r.slugs).slice(0, 2000).map((s) => slugOf(str(s, 300))).filter(Boolean));
+    if (!r.ok || !slugs.size) {
+      const msg = str(r.error || (r.ok ? "頁面沒有任何商品連結(可能被擋或網站改版)" : `HTTP ${r.status}`));
+      st.ok = false;
+      if (st.error !== msg) this.log("warn", `[${name}] ${msg}`);
+      st.error = msg;
+      return;
     }
-    return {
-      enabled: this.s.enabled,
-      base_url: cfg.base_url,
-      sources: cfg.sources,
-      pending: Object.keys(this.s.pending),
-    };
+    if (st.error) this.log("info", `[${name}] 恢復正常`);
+    Object.assign(st, { ok: true, error: "", count: slugs.size, scans: st.scans + 1 });
+
+    if (!this.s.baselined[name]) {
+      for (const s of slugs) this.known.add(s);
+      this.s.baselined[name] = true;
+      this.log("info", `[${name}] 建立基準:${slugs.size} 件商品,既有商品不通知`);
+      return;
+    }
+    const fresh = [...slugs].filter((s) => !this.known.has(s));
+    if (!fresh.length) return;
+    for (const s of fresh) this.known.add(s);
+    fresh.sort((a, b) => Number(prefixOk(cfg, b)) - Number(prefixOk(cfg, a)));
+    this.log("info", `[${name}] 發現新商品網址 ${fresh.length} 件:${fresh.slice(0, MAX_NEED).join(", ")}`);
+    for (const s of fresh) need.add(s);
   }
 
-  /** 收下各來源的商品列表 → 回覆需要抓商品頁的代碼。 */
-  async ingest(body) {
-    if (!this.s.enabled) return { fetch: [] };
-    const cfg = this.s.config;
-    this.s.lastIngestAt = Date.now();
-    const names = new Set(cfg.sources.map((s) => s.name));
-    const fresh = [];
+  /** 下單結果。r = { slug, ok, dry_run, message, url? } */
+  async applyOrder(r) {
+    const slug = slugOf(str(r.slug, 300));
+    const item = this.s.orders.items[slug] || (this.s.orders.items[slug] = { t: Date.now() });
+    const msg = str(r.message, 400);
+    item.state = r.ok ? (r.dry_run ? "dry" : "ok") : "fail";
+    item.message = msg;
+    this.dirty = true;
+    const url = productUrl(this.s.config.base_url, slug);
+    const name = item.name || slug;
+    if (r.ok && !r.dry_run) {
+      this.s.orders.count++;
+      await this.notify("✅ 自動下單完成", `${name}\n${msg}\n請到 Funbox 會員中心確認訂單並完成付款。`);
+    } else if (r.ok) {
+      await this.notify("🧪 演練完成(未送出訂單)", `${name}\n${msg}`);
+    } else {
+      await this.notify("❌ 自動下單失敗,請立刻手動結帳", `${name}\n${msg}\n${url}`, "error");
+    }
+  }
 
-    for (const r of Array.isArray(body.sources) ? body.sources : []) {
-      const name = str(r?.name, 100);
-      if (!names.has(name)) continue;
-      const st = (this.s.src[name] ||= { scans: 0, ok: null, at: 0, ms: 0, count: 0, error: "" });
-      st.at = Date.now();
-      st.ms = Math.max(0, Math.round(Number(r.ms) || 0));
+  async report(b) {
+    const buys = [];
+    const prev = this.s.poller;
+    const buyer = b.buyer && typeof b.buyer === "object" ? { ok: !!b.buyer.ok, msg: str(b.buyer.msg, 200) } : null;
+    this.s.poller = { at: Date.now(), runner: str(b.runner, 80), buyer: buyer?.ok ? true : false, buyerMsg: buyer?.msg || "" };
+    if (!prev || Date.now() - prev.at > POLLER_STALE_MS) this.log("info", `電腦偵測程式已連線(${this.s.poller.runner})`);
+    this.dirty = true;
 
-      if (!r.ok) {
-        const msg = str(r.error || "抓取失敗", 200);
-        if (st.error !== msg) this.log("warn", `[${name}] ${msg}`);
-        st.ok = false;
-        st.error = msg;
-        continue;
-      }
-      const slugs = (Array.isArray(r.slugs) ? r.slugs : [])
-        .slice(0, MAX_SLUGS_PER_SOURCE)
-        .map((s) => str(s, 200).toLowerCase())
-        .filter(Boolean);
-      if (!slugs.length) {
-        st.ok = false;
-        st.error = "頁面沒有任何商品連結(可能被擋或網站改版)";
-        this.log("warn", `[${name}] ${st.error}`);
-        continue;
-      }
-      if (st.error) this.log("info", `[${name}] 恢復正常`);
-      st.ok = true;
-      st.error = "";
-      st.scans++;
-      st.count = slugs.length;
+    for (const n of arr(b.notices).slice(0, 5)) await this.notify("⚠ 電腦下單程式", str(n, 400), "warn");
+    for (const o of arr(b.orders).slice(0, 10)) await this.applyOrder(o);
 
-      if (!this.s.baselined[name]) {
-        for (const s of slugs) this.known.add(s);
-        this.s.baselined[name] = true;
-        this.log("info", `[${name}] 建立基準:${slugs.length} 件商品,既有商品不通知`);
-        continue;
-      }
-      for (const s of slugs) {
-        if (!this.known.has(s)) {
-          this.known.add(s);
-          fresh.push(s);
+    const need = new Set();
+    if (this.s.enabled) {
+      for (const r of arr(b.sources).slice(0, 10)) this.applySource(r, need);
+      // 商品逐一處理(依序,避免同一商品重複下單)
+      for (const r of arr(b.products).slice(0, 40)) await this.applyProduct(r, buys);
+
+      const cfg = this.s.config;
+      const now = Date.now();
+      for (const [slug, v] of Object.entries(this.s.pending)) {
+        if (now - v.t > cfg.pending.timeout_minutes * 60_000) {
+          this.log("info", `追蹤逾時,放棄 ${slug}`);
+          this.untrack(slug);
         }
       }
     }
+    if (this.dirty) await this.save();
 
-    fresh.sort((a, b) => Number(prefixOk(cfg, b)) - Number(prefixOk(cfg, a)));
-    if (fresh.length) {
-      this.log("info", `發現新商品網址 ${fresh.length} 件:${fresh.slice(0, MAX_FETCH_PER_RUN).join(", ")}`);
-      if (fresh.length > MAX_FETCH_PER_RUN) {
-        this.log("warn", `一次出現太多新商品,只處理前 ${MAX_FETCH_PER_RUN} 件`);
-      }
-    }
-    const pending = Object.keys(this.s.pending);
-    const want = [...new Set([...fresh, ...pending])].filter((s) => !this.done.has(s));
-    await this.save();
-    return { fetch: want.slice(0, MAX_FETCH_PER_RUN) };
-  }
-
-  /** 收下輪詢程式抓回來的商品資料並評估。 */
-  async ingestProducts(body) {
-    if (!this.s.enabled) return { ok: true };
-    this.s.lastIngestAt = Date.now();
-    for (const raw of Array.isArray(body.products) ? body.products.slice(0, MAX_FETCH_PER_RUN) : []) {
-      const slug = str(raw?.slug, 200).toLowerCase();
-      if (!slug) continue;
-      if (raw.error) {
-        this.log("warn", `抓取 ${slug} 失敗:${str(raw.error, 120)}`);
-        this.track(slug);
-        continue;
-      }
-      const exists = raw.exists !== false;
-      const p = {
-        slug,
-        exists,
-        name: str(raw.name, 200) || slug,
-        price: Number(raw.price) || 0,
-        variantId: raw.variantId ?? null,
-        status: str(raw.status, 40) || "unknown",
-        soldOutButton: !!raw.soldOutButton,
-      };
-      p.inStock = p.exists && p.status !== "empty" && !p.soldOutButton;
-      await this.evaluate(slug, p);
-    }
-    await this.save();
-    return { ok: true };
+    const cfg = this.s.config;
+    return {
+      enabled: this.s.enabled,
+      config: {
+        base_url: cfg.base_url,
+        sources: cfg.sources,
+        pending_interval: cfg.pending.interval,
+        buy_enabled: cfg.buy.enabled,
+      },
+      need: [...need].slice(0, MAX_NEED),
+      pending: Object.entries(this.s.pending)
+        .sort((a, b) => a[1].t - b[1].t)
+        .slice(0, MAX_PENDING)
+        .map(([s]) => s),
+      buys,
+    };
   }
 
   // ---------------------------------------------------------------- HTTP 介面
@@ -312,17 +358,11 @@ export class Monitor extends DurableObject {
 
     if (method === "GET" && path === "/state") return json(this.snapshot());
 
-    if (method === "GET" && path === "/poll-plan") {
-      const plan = this.pollPlan();
-      if (this.dirty) await this.save();
-      return json(plan);
-    }
-    if (method === "POST" && path === "/ingest") return json(await this.ingest(body));
-    if (method === "POST" && path === "/ingest-products") return json(await this.ingestProducts(body));
+    if (method === "POST" && path === "/report") return json(await this.report(body));
 
     if (method === "POST" && path === "/start") {
       this.s.enabled = true;
-      this.log("info", "▶ 開始監控(由輪詢程式定時回報)");
+      this.log("info", "▶ 開始監控");
       await this.save();
       return json({ ok: true });
     }
@@ -337,31 +377,30 @@ export class Monitor extends DurableObject {
     if (method === "PUT" && path === "/config") {
       const { cfg, error } = sanitizeConfig(body);
       if (error) return json({ error }, 400);
+      const prevBuy = this.s.config.buy;
       this.s.config = cfg;
-      // 移除已刪除來源的基準與狀態,新來源會重新建立基準
       const names = new Set(cfg.sources.map((s) => s.name));
       for (const n of Object.keys(this.s.baselined)) if (!names.has(n)) delete this.s.baselined[n];
       for (const n of Object.keys(this.s.src)) if (!names.has(n)) delete this.s.src[n];
       this.log("info", "設定已更新");
+      if (cfg.buy.live && !prevBuy.live) this.log("warn", "⚠ 已切換為「正式下單」模式");
       await this.save();
       return json({ ok: true, config: cfg });
     }
 
     if (method === "POST" && path === "/watch") {
-      const raw = String(body.input || "").trim();
-      const slug = slugOf(raw);
+      const slug = slugOf(String(body.input || "").trim());
       if (!slug || /\s/.test(slug)) return json({ error: "請輸入商品網址或代碼" }, 400);
       this.done.delete(slug);
       delete this.s.announced[slug];
       this.track(slug, true);
-      this.log("info", `手動加入追蹤:${slug}(下次輪詢時檢查)`);
+      this.log("info", `手動加入追蹤:${slug}(電腦下次回報時檢查)`);
       await this.save();
       return json({ ok: true, slug });
     }
 
     if (method === "DELETE" && path.startsWith("/pending/")) {
-      const slug = decodeURIComponent(path.slice("/pending/".length));
-      this.untrack(slug);
+      this.untrack(decodeURIComponent(path.slice("/pending/".length)));
       await this.save();
       return json({ ok: true });
     }
@@ -371,7 +410,14 @@ export class Monitor extends DurableObject {
       this.done = new Set();
       this.s.baselined = {};
       this.s.announced = {};
-      this.log("info", "已重設基準:下次輪詢會重新記錄既有商品");
+      this.log("info", "已重設基準:下次掃描會重新記錄既有商品");
+      await this.save();
+      return json({ ok: true });
+    }
+
+    if (method === "POST" && path === "/reset-orders") {
+      this.s.orders = { count: 0, items: {} };
+      this.log("info", "已清除下單紀錄與計數");
       await this.save();
       return json({ ok: true });
     }
@@ -387,6 +433,25 @@ export class Monitor extends DurableObject {
       return json(r, r.ok ? 200 : 400);
     }
 
+    if (method === "POST" && path === "/test-fetch") {
+      // 從 Cloudflare 直接讀(預期會被擋,僅供診斷)
+      const results = await Promise.all(
+        this.s.config.sources.map(async (src) => {
+          const t0 = Date.now();
+          try {
+            const u = src.url.startsWith("http") ? src.url : this.s.config.base_url + src.url;
+            const { resp, text } = await fetchText(u);
+            const blocked = looksBlocked(resp, text);
+            const slugs = resp.ok && !blocked ? extractSlugs(text).size : 0;
+            return { name: src.name, status: resp.status, ms: Date.now() - t0, slugs, blocked, ok: resp.ok && !blocked && slugs > 0 };
+          } catch (e) {
+            return { name: src.name, ok: false, ms: Date.now() - t0, error: String(e.message || e) };
+          }
+        }),
+      );
+      return json({ results });
+    }
+
     return json({ error: "not found" }, 404);
   }
 
@@ -395,14 +460,23 @@ export class Monitor extends DurableObject {
     return {
       now: Date.now(),
       enabled: this.s.enabled,
-      lastIngestAt: this.s.lastIngestAt,
+      pollerOnline: this.pollerOnline(),
+      poller: this.s.poller,
       hasWebhook: !!(this.env.DISCORD_WEBHOOK || "").trim(),
+      hasPollerToken: (this.env.POLLER_TOKEN || "").length >= 16,
       config: cfg,
       sources: cfg.sources.map((s) => ({
         name: s.name,
         ...(this.s.src[s.name] || { scans: 0, ok: null, at: 0, ms: 0, count: 0, error: "" }),
       })),
       pending: Object.entries(this.s.pending).map(([slug, v]) => ({ slug, since: v.t, manual: !!v.manual })),
+      orders: {
+        count: this.s.orders.count,
+        items: Object.entries(this.s.orders.items)
+          .slice(-10)
+          .reverse()
+          .map(([slug, v]) => ({ slug, ...v })),
+      },
       knownCount: this.known.size,
       logs: this.s.logs.slice(-100),
     };

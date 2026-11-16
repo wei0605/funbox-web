@@ -100,3 +100,6 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .toast { position: fixed; left: 16px; right: 16px; top: calc(60px + env(safe-area-inset-top)); z-index: 10; padding: 12px 14px; border-radius: 12px; background: #263041; border: 1px solid var(--line); text-align: center; }
 .toast.bad { background: #3a1f20; color: #ffb4b2; }
+
+.check { display: flex; align-items: center; gap: 8px; }
+.check input { width: auto; margin: 0; }

@@ -10,13 +10,20 @@ async function sha256(s) {
 }
 
 /** 比對雜湊值,避免時間差攻擊。 */
-async function tokenOk(request, env) {
-  const expected = env.ADMIN_TOKEN;
+async function sameSecret(given, expected) {
   if (!expected || expected.length < 16) return false; // 未設定或太短一律拒絕
-  const auth = request.headers.get("authorization") || "";
-  const given = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   const [a, b] = await Promise.all([sha256(given), sha256(expected)]);
   return crypto.subtle.timingSafeEqual(a, b);
+}
+
+/** 回傳 "admin"(手機控制台)、"poller"(電腦上的偵測程式,只能回報)或 null。 */
+async function whoIs(request, env) {
+  const auth = request.headers.get("authorization") || "";
+  const given = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!given) return null;
+  if (await sameSecret(given, env.ADMIN_TOKEN)) return "admin";
+  if (await sameSecret(given, env.POLLER_TOKEN)) return "poller";
+  return null;
 }
 
 const jsonResp = (data, status) =>
@@ -32,8 +39,10 @@ export default {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
 
-    if (!(await tokenOk(request, env))) {
-      return jsonResp({ error: "unauthorized" }, 401);
+    const who = await whoIs(request, env);
+    if (!who) return jsonResp({ error: "unauthorized" }, 401);
+    if (who === "poller" && !(request.method === "POST" && url.pathname === "/api/report")) {
+      return jsonResp({ error: "forbidden" }, 403);
     }
     // /api/xxx → DO 內的 /xxx(只轉送白名單方法,避免任意請求進到 DO)
     if (!["GET", "POST", "PUT", "DELETE"].includes(request.method)) {

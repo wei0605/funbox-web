@@ -118,10 +118,9 @@ function render() {
   const st = state;
 
   // 狀態標籤與主按鈕
-  const STALE_MS = 15 * 60 * 1000;
-  const stalled = st.enabled && st.now - st.lastIngestAt > STALE_MS;
+  const stalled = st.enabled && !st.pollerOnline;
   const pill = $("#pill");
-  pill.textContent = stalled ? "等待輪詢" : st.enabled ? "監控中" : "已停止";
+  pill.textContent = stalled ? "等待電腦" : st.enabled ? "監控中" : "已停止";
   pill.className = "pill " + (stalled ? "warn" : st.enabled ? "on" : "off");
   const tb = $("#toggleBtn");
   tb.textContent = st.enabled ? "■ 停止監控" : "▶ 開始監控";
@@ -130,12 +129,34 @@ function render() {
   // 警示
   let w = "";
   if (!st.hasWebhook) w += `<div class="banner bad">尚未設定 Discord Webhook,偵測到商品也不會通知。請在部署時設定 DISCORD_WEBHOOK。</div>`;
-  if (stalled) {
-    w += `<div class="banner">${
-      st.lastIngestAt ? `已超過 ${Math.floor((st.now - st.lastIngestAt) / 60000)} 分鐘沒有收到輪詢回報` : "還沒收到輪詢程式的回報"
-    }。請到 GitHub 專案的 Actions 頁面,確認 poll-funbox 有在執行。</div>`;
-  }
+  if (!st.hasPollerToken) w += `<div class="banner bad">尚未設定 POLLER_TOKEN,電腦上的偵測程式無法回報。</div>`;
+  if (stalled) w += `<div class="banner">電腦上的偵測程式目前沒有回報。請確認家裡電腦開著,而且 start-monitor.bat 視窗正在執行。</div>`;
+  if (st.config.buy.enabled && st.config.buy.live) w += `<div class="banner bad">自動下單:正式送出模式</div>`;
   $("#warnings").innerHTML = w;
+
+  // 電腦偵測程式
+  const pl = st.poller;
+  const buy = st.config.buy;
+  const buyInfo = !buy.enabled
+    ? "自動下單:關閉"
+    : pl?.buyer
+      ? `自動下單:就緒(${buy.live ? "正式" : "演練"},關鍵字 ${buy.keywords.length ? esc(buy.keywords.join("、")) : "未設定"})`
+      : `自動下單:未就緒${pl?.buyerMsg ? " · " + esc(pl.buyerMsg) : ""}`;
+  $("#poller").innerHTML = `<div class="card src"><span class="dot ${st.pollerOnline ? "ok" : "bad"}"></span>
+    <div><div class="name">${st.pollerOnline ? "上線中" : "離線"}</div>
+    <div class="info">${pl ? `最後回報 ${ago(pl.at, st.now)}` : "從未回報"}</div>
+    <div class="info">${buyInfo}</div></div></div>`;
+
+  // 下單紀錄
+  const stateText = { sent: "處理中", ok: "✅ 已下單", dry: "🧪 演練完成", fail: "❌ 失敗" };
+  $("#orders").innerHTML = st.orders.items.length
+    ? st.orders.items
+        .map(
+          (o) => `<div class="card"><div class="name">${esc(o.name || o.slug)}</div>
+            <div class="muted small">${stateText[o.state] || esc(o.state)} · ${fmtTime(o.t)}${o.message ? " · " + esc(o.message) : ""}</div></div>`,
+        )
+        .join("")
+    : `<div class="muted small center">還沒有下單紀錄(正式下單 ${st.orders.count} 張)</div>`;
 
   // 來源
   $("#sources").innerHTML = st.sources
@@ -162,7 +183,7 @@ function render() {
         )
         .join("")
     : `<div class="muted small center">目前沒有追蹤中的商品</div>`;
-  $("#meta").textContent = `已記錄 ${st.knownCount} 件既有商品 · 輪詢最近回報:${st.lastIngestAt ? ago(st.lastIngestAt, st.now) : "尚無"}`;
+  $("#meta").textContent = `已記錄 ${st.knownCount} 件既有商品`;
 
   // 日誌
   $("#logs").innerHTML = st.logs.length
@@ -204,6 +225,13 @@ function loadForm(c) {
   $("#f_cap").value = c.notify.max_unit_price;
   $("#f_cart").value = c.notify.cart_link_template;
   $("#f_qty").value = c.notify.cart_qty;
+  $("#b_enabled").checked = c.buy.enabled;
+  $("#b_live").checked = c.buy.live;
+  $("#b_kw").value = c.buy.keywords.join(", ");
+  $("#b_qty").value = c.buy.quantity;
+  $("#b_max").value = c.buy.max_orders;
+  $("#b_pay").value = c.buy.payment_keyword;
+  $("#b_ship").value = c.buy.shipping_keyword;
   formLoaded = true;
 }
 
@@ -227,6 +255,15 @@ function readForm() {
       cart_link_template: $("#f_cart").value.trim(),
       cart_qty: Number($("#f_qty").value) || 1,
     },
+    buy: {
+      enabled: $("#b_enabled").checked,
+      live: $("#b_live").checked,
+      keywords: list($("#b_kw").value),
+      quantity: Number($("#b_qty").value) || 1,
+      max_orders: Number($("#b_max").value) || 1,
+      payment_keyword: $("#b_pay").value.trim(),
+      shipping_keyword: $("#b_ship").value.trim(),
+    },
   };
 }
 
@@ -236,7 +273,10 @@ $("#addSource").onclick = () => $("#f_sources").appendChild(sourceRow());
 $("#settingsForm").onsubmit = (e) => {
   e.preventDefault();
   run($("#saveBtn"), async () => {
-    const r = await api("/config", "PUT", readForm());
+    const f = readForm();
+    if (f.buy.enabled && f.buy.live && !state.config.buy.live &&
+        !confirm("確定要開啟「正式送出訂單」?符合關鍵字的商品會真的下單。")) return;
+    const r = await api("/config", "PUT", f);
     loadForm(r.config);
     toast("設定已儲存");
     await refresh();
@@ -256,7 +296,7 @@ $("#watchForm").onsubmit = (e) => {
   run(e.submitter || $("#watchForm button"), async () => {
     const r = await api("/watch", "POST", { input });
     $("#watchInput").value = "";
-    toast(`已加入追蹤:${r.slug}`);
+    toast(`已加入追蹤:${r.slug},電腦下次回報時檢查`);
     await refresh();
   });
 };
@@ -274,6 +314,14 @@ $("#testDiscord").onclick = () =>
   run($("#testDiscord"), async () => {
     await api("/test-discord", "POST", {});
     toast("測試通知已送出,請查看 Discord");
+  });
+
+$("#resetOrders").onclick = () =>
+  run($("#resetOrders"), async () => {
+    if (!confirm("清除下單紀錄後,已下單過的商品也可能再次下單。確定?")) return;
+    await api("/reset-orders", "POST", {});
+    toast("已清除下單紀錄");
+    await refresh();
   });
 
 $("#resetBtn").onclick = () =>
