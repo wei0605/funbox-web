@@ -40,7 +40,7 @@
       <div id="warnings"></div>
       <button id="toggleBtn" class="btn big">…</button>
 
-      <h2>電腦偵測程式</h2>
+      <h2>偵測引擎</h2>
       <div id="poller" class="stack"></div>
 
       <h2>監控來源</h2>
@@ -67,7 +67,7 @@
 
         <div class="card stack">
           <h2>監控來源</h2>
-          <p class="muted small">掃描商品列表頁,偵測新出現的商品網址。由家裡電腦上的程式依「間隔」持續輪詢(最短 3 秒)。</p>
+          <p class="muted small">掃描商品列表頁,偵測新出現的商品網址。GitHub Actions 雲端排程約每 5 分鐘掃描一次(電腦不用開機);若使用本機程式則依「間隔」秒數輪詢。</p>
           <div id="f_sources" class="stack"></div>
           <button type="button" id="addSource" class="btn">＋ 新增來源</button>
         </div>
@@ -100,8 +100,8 @@
         </div>
 
         <div class="card stack">
-          <h2>自動下單</h2>
-          <p class="muted small">有貨且名稱含「下單關鍵字」時,由家裡電腦上的程式在 FunboxSniper 的專屬 Chrome 加入購物車、自動填入信用卡並送出。銀行簡訊驗證需要您在那台電腦的 Chrome 輸入驗證碼(Discord 會通知)。</p>
+          <h2>本機自動下單(選用,雲端模式免設)</h2>
+          <p class="muted small">GitHub Actions 雲端模式完全不儲存信用卡,收到 Discord 通知後直接在 iPhone Safari 點連結結帳即可。此區僅在電腦開著執行 start-monitor.bat 時生效。</p>
           <label class="check"><input type="checkbox" id="b_enabled"> 啟用自動下單</label>
           <label class="check"><input type="checkbox" id="b_live"> 正式送出訂單(不勾 = 演練,只走到結帳頁)</label>
           <label>下單關鍵字(逗號分隔,留空 = 不下單)<input id="b_kw" placeholder="例:BX-01, 天馬"></label>

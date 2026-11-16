@@ -1,35 +1,40 @@
-// 在「您家裡的電腦」執行的偵測 + 下單程式:抓 Funbox 網頁 → 回報給 Cloudflare Worker(大腦)→ 依指示自動下單。
+// 偵測程式:可跑在 GitHub Actions(--once 單次排程,免安裝套件)或家裡電腦(持續輪詢)。
+// 負責抓 Funbox 網頁並透過 POST /api/report 回報給 Cloudflare Worker(大腦)判斷新品、補貨與通知。
 //
-// 設定放在 poller/local.env(不會上傳到 GitHub),範本見 poller/local.env.example:
+// 環境變數(本機可放 poller/local.env;GitHub Actions 放 Repository Secrets):
 //   WORKER_URL      Worker 網址
-//   POLLER_TOKEN    與 Worker 的 POLLER_TOKEN 相同
-//   DISCORD_WEBHOOK (選填)傳下單截圖用
-//   CHROME_PROFILE  FunboxSniper 專屬 Chrome 的設定檔資料夾(登入狀態在這裡)
-//   CARD_FILE       FunboxSniper 存的 card.dat(加密信用卡)
-//   BUY_ENABLED     0 = 不啟動下單程式,只偵測
+//   POLLER_TOKEN    與 Worker 的 POLLER_TOKEN(或 ADMIN_TOKEN)相同
+//   BUY_ENABLED     0 = 只偵測不下單(GitHub Actions 固定為 0)
 //
 // 用法:
-//   start-monitor.bat                       持續監控(關閉視窗即停止)
-//   node poller/run.mjs --test-buy bb09728  對有貨商品演練下單(走到結帳頁就停,絕不送出)
+//   node poller/run.mjs --once              單次掃描(GitHub Actions 排程使用)
+//   start-monitor.bat                       本機持續監控(選用)
+//   node poller/run.mjs --test-buy bb09728  本機演練下單
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import { fetchProduct, fetchText, extractSlugs, looksBlocked } from "../src/parse.js";
-import { Buyer, sendDiscordFile } from "./checkout.mjs";
 
 // 讀 poller/local.env(已經有的環境變數優先)
 const ENV_FILE = new URL("./local.env", import.meta.url);
 if (existsSync(ENV_FILE)) {
   for (const line of readFileSync(ENV_FILE, "utf8").split(/\r?\n/)) {
     const m = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
-    if (m && !line.trim().startsWith("#") && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^"(.*)"$/, "$1");
+    if (m && !line.trim().startsWith("#") && process.env[m[1]] === undefined) {
+      process.env[m[1]] = m[2].replace(/^"(.*)"$/, "$1");
+    }
   }
 }
 
+const IS_GHA = process.env.GITHUB_ACTIONS === "true";
+const ONCE = process.argv.includes("--once") || process.env.ONCE === "1" || (IS_GHA && !process.env.RUN_MINUTES);
 const WORKER = (process.env.WORKER_URL || "").trim().replace(/\/+$/, "");
-const TOKEN = (process.env.POLLER_TOKEN || "").trim();
-const RUN_MS = Number(process.env.RUN_MINUTES) > 0 ? Number(process.env.RUN_MINUTES) * 60_000 : Infinity; // 預設一直跑
+const TOKEN = (process.env.POLLER_TOKEN || process.env.ADMIN_TOKEN || "").trim();
+const RUN_MS = Number(process.env.RUN_MINUTES) > 0 ? Number(process.env.RUN_MINUTES) * 60_000 : Infinity;
 const HOOK = (process.env.DISCORD_WEBHOOK || "").trim();
-const RUNNER = `電腦 ${os.hostname()}`;
+const RUNNER = IS_GHA ? "GitHub Actions" : `電腦 ${os.hostname()}`;
+const MODE = ONCE ? "cron" : "loop";
+const BUY_ON = !ONCE && !IS_GHA && process.env.BUY_ENABLED !== "0";
+
 const TEST_SLUG = (() => {
   const i = process.argv.indexOf("--test-buy");
   return i > 0 ? String(process.argv[i + 1] || "").trim().toLowerCase() : "";
@@ -58,10 +63,16 @@ function absUrl(base, u) {
 async function scanSource(base, src) {
   const t0 = Date.now();
   try {
-    const { resp, text } = await fetchText(absUrl(base, src.url), 10_000);
+    const { resp, text } = await fetchText(absUrl(base, src.url), 12_000);
     const blocked = resp.ok && looksBlocked(resp, text);
     if (!resp.ok || blocked) {
-      return { name: src.name, ok: false, status: resp.status, ms: Date.now() - t0, error: blocked ? "被 Cloudflare 驗證頁擋下" : `HTTP ${resp.status}` };
+      return {
+        name: src.name,
+        ok: false,
+        status: resp.status,
+        ms: Date.now() - t0,
+        error: blocked ? "被 Cloudflare 驗證頁擋下" : `HTTP ${resp.status}`,
+      };
     }
     return { name: src.name, ok: true, status: resp.status, ms: Date.now() - t0, slugs: [...extractSlugs(text)] };
   } catch (e) {
@@ -79,15 +90,18 @@ async function checkProduct(base, slug, first) {
 }
 
 async function report(payload) {
+  const body = { runner: RUNNER, mode: MODE, ...payload };
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const r = await fetch(WORKER + "/api/report", {
         method: "POST",
         headers: { authorization: "Bearer " + TOKEN, "content-type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(15_000),
       });
-      if (r.status === 401 || r.status === 403) throw Object.assign(new Error(`Worker 拒絕(HTTP ${r.status}):POLLER_TOKEN 不正確`), { fatal: true });
+      if (r.status === 401 || r.status === 403) {
+        throw Object.assign(new Error(`Worker 拒絕(HTTP ${r.status}):請確認 GitHub Secrets 的 POLLER_TOKEN 是否正確`), { fatal: true });
+      }
       if (!r.ok) throw new Error(`Worker HTTP ${r.status}`);
       return await r.json();
     } catch (e) {
@@ -99,9 +113,47 @@ async function report(payload) {
   return null;
 }
 
-// ------------------------------------------------------------------ 演練模式(單一商品)
+// ------------------------------------------------------------------ 單次掃描(GitHub Actions)
+async function runOnce() {
+  if (!WORKER || !TOKEN) {
+    throw new Error("缺少 WORKER_URL 或 POLLER_TOKEN(請在 GitHub Settings → Secrets → Actions 新增 POLLER_TOKEN)");
+  }
+  const buyerInfo = { ok: false, msg: "雲端排程僅通知模式" };
+  let plan = await report({ buyer: buyerInfo });
+  if (!plan) throw new Error("連不上 Worker,請確認 WORKER_URL");
+
+  if (!plan.enabled) {
+    log("控制台目前為「已停止」,略過本輪掃描");
+    return;
+  }
+
+  const base = plan.config.base_url;
+  const [srcRes, prodRes] = await Promise.all([
+    Promise.all(plan.config.sources.map((s) => scanSource(base, s))),
+    Promise.all((plan.pending || []).map((s) => checkProduct(base, s, false))),
+  ]);
+
+  for (const r of srcRes) {
+    if (r.ok) log(`[${r.name}] 讀到 ${r.slugs.length} 件商品 (${r.ms}ms)`);
+    else log(`[${r.name}] 失敗:${r.error}`);
+  }
+  if (prodRes.length) log(`檢查追蹤清單 ${prodRes.length} 件商品`);
+
+  let payload = { buyer: buyerInfo, sources: srcRes, products: prodRes };
+  for (let round = 0; round < 3; round++) {
+    const res = await report(payload);
+    if (!res || !res.need?.length) break;
+    log(`發現新商品網址 ${res.need.length} 件:${res.need.join(", ")},抓取商品頁…`);
+    const followProducts = await Promise.all(res.need.map((s) => checkProduct(res.config.base_url, s, true)));
+    payload = { buyer: buyerInfo, sources: [], products: followProducts };
+  }
+  log("本輪掃描完成");
+}
+
+// ------------------------------------------------------------------ 演練模式(本機單一商品)
 async function testBuy(slug) {
   if (!slug) throw new Error("用法:node poller/run.mjs --test-buy 商品代碼");
+  const { Buyer } = await import("./checkout.mjs");
   const base = process.env.BASE_URL || "https://shop.funbox.com.tw";
   const p = await fetchProduct(base, slug);
   log(`商品 ${slug}:${p.name || ""} ${p.exists ? (p.inStock ? "有貨" : "缺貨") : "頁面不存在"}`);
@@ -110,16 +162,21 @@ async function testBuy(slug) {
   await buyer.start();
   log("登入狀態:", buyer.status().msg);
   const r = await buyer.buy({
-    slug, variantId: p.variantId, name: p.name, qty: 1, live: false,
-    payment_keyword: process.env.PAYMENT_KEYWORD ?? "信用卡", shipping_keyword: process.env.SHIPPING_KEYWORD || "",
+    slug,
+    variantId: p.variantId,
+    name: p.name,
+    qty: 1,
+    live: false,
+    payment_keyword: process.env.PAYMENT_KEYWORD ?? "信用卡",
+    shipping_keyword: process.env.SHIPPING_KEYWORD || "",
   });
   log("結果:", r.ok ? "成功" : "失敗", r.message);
   await buyer.close();
   if (!r.ok) process.exitCode = 1;
 }
 
-// ------------------------------------------------------------------ 主迴圈
-async function main() {
+// ------------------------------------------------------------------ 常駐迴圈(家裡電腦選用)
+async function runLoop() {
   if (!WORKER || !TOKEN) throw new Error("請設定 WORKER_URL 與 POLLER_TOKEN");
   const deadline = Date.now() + RUN_MS;
   log(`啟動(${RUNNER})`);
@@ -128,10 +185,11 @@ async function main() {
   const notices = [];
   const buyerStatus = () => (buyer ? buyer.status() : { ok: false, msg: "下單程式未啟用(BUY_ENABLED=0)" });
 
-  let plan = await report({ runner: RUNNER, buyer: buyerStatus() });
+  let plan = await report({ buyer: buyerStatus() });
   if (!plan) throw new Error("連不上 Worker,請確認 WORKER_URL");
 
-  if (process.env.BUY_ENABLED !== "0") {
+  if (BUY_ON) {
+    const { Buyer } = await import("./checkout.mjs");
     buyer = new Buyer(buyerOptions(plan.config.base_url));
     try {
       await buyer.start();
@@ -141,7 +199,7 @@ async function main() {
       log("下單程式啟動失敗:", e.message);
       notices.push(`下單程式啟動失敗:${e.message}`);
     }
-    plan = (await report({ runner: RUNNER, buyer: buyerStatus(), notices: notices.splice(0) })) || plan;
+    plan = (await report({ buyer: buyerStatus(), notices: notices.splice(0) })) || plan;
   }
   log(plan.enabled ? "控制台狀態:監控中" : "控制台狀態:已停止(等待在手機按「開始監控」)");
 
@@ -153,7 +211,7 @@ async function main() {
 
   while (Date.now() < deadline) {
     const now = Date.now();
-    const payload = { runner: RUNNER, buyer: buyerStatus(), notices: notices.splice(0), sources: [], products: [], orders: [] };
+    const payload = { buyer: buyerStatus(), notices: notices.splice(0), sources: [], products: [], orders: [] };
     const base = plan.config.base_url;
 
     if (plan.enabled !== wasEnabled) {
@@ -175,7 +233,6 @@ async function main() {
       for (const r of srcRes) if (!r.ok) log(`[${r.name}] ${r.error}`);
     }
 
-    // 登入保持(每 10 分鐘)
     if (buyer?.ready && now - lastKeepalive > KEEPALIVE_MS) {
       lastKeepalive = now;
       const before = buyer.status().ok;
@@ -189,13 +246,12 @@ async function main() {
       continue;
     }
 
-    // 回報;新網址要抓商品頁、有下單指示要下單,做完再回報一次(最多連續 3 輪)
     for (let round = 0; round < 3; round++) {
       const res = await report(payload);
       lastReport = Date.now();
       if (!res) break;
       plan = res;
-      const follow = { runner: RUNNER, buyer: buyerStatus(), notices: [], products: [], orders: [] };
+      const follow = { buyer: buyerStatus(), notices: [], products: [], orders: [] };
       if (plan.buys?.length) {
         for (const order of plan.buys) {
           log(`下單 ${order.slug}(${order.live ? "正式" : "演練"})`);
@@ -217,11 +273,12 @@ async function main() {
   await buyer?.close();
 }
 
-const run = process.argv.includes("--test-buy") ? testBuy(TEST_SLUG) : main();
-run.catch((e) => {
+const entry = process.argv.includes("--test-buy") ? testBuy(TEST_SLUG) : ONCE ? runOnce() : runLoop();
+entry.catch(async (e) => {
   console.error(ts(), "錯誤:", e.message);
-  if (HOOK && !TEST_SLUG) {
-    sendDiscordFile(HOOK, `**⚠ 電腦上的偵測程式停止**\n${e.message}`).catch(() => {});
+  if (HOOK && !TEST_SLUG && !ONCE) {
+    const { sendDiscordFile } = await import("./checkout.mjs").catch(() => ({}));
+    if (sendDiscordFile) await sendDiscordFile(HOOK, `**⚠ 電腦上的偵測程式停止**\n${e.message}`).catch(() => {});
   }
   process.exitCode = 1;
 });

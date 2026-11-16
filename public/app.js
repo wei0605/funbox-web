@@ -118,9 +118,11 @@ function render() {
   const st = state;
 
   // 狀態標籤與主按鈕
+  const pl = st.poller;
+  const isCron = !pl || pl.mode === "cron";
   const stalled = st.enabled && !st.pollerOnline;
   const pill = $("#pill");
-  pill.textContent = stalled ? "等待電腦" : st.enabled ? "監控中" : "已停止";
+  pill.textContent = stalled ? "等待排程" : st.enabled ? "監控中" : "已停止";
   pill.className = "pill " + (stalled ? "warn" : st.enabled ? "on" : "off");
   const tb = $("#toggleBtn");
   tb.textContent = st.enabled ? "■ 停止監控" : "▶ 開始監控";
@@ -129,23 +131,31 @@ function render() {
   // 警示
   let w = "";
   if (!st.hasWebhook) w += `<div class="banner bad">尚未設定 Discord Webhook,偵測到商品也不會通知。請在部署時設定 DISCORD_WEBHOOK。</div>`;
-  if (!st.hasPollerToken) w += `<div class="banner bad">尚未設定 POLLER_TOKEN,電腦上的偵測程式無法回報。</div>`;
-  if (stalled) w += `<div class="banner">電腦上的偵測程式目前沒有回報。請確認家裡電腦開著,而且 start-monitor.bat 視窗正在執行。</div>`;
-  if (st.config.buy.enabled && st.config.buy.live) w += `<div class="banner bad">自動下單:正式送出模式</div>`;
+  if (!st.hasPollerToken) w += `<div class="banner bad">尚未設定 POLLER_TOKEN,偵測程式無法回報。</div>`;
+  if (stalled) {
+    w += isCron
+      ? `<div class="banner">等待 GitHub Actions 排程回報(約每 5～15 分鐘自動掃描一次;也可到 GitHub → Actions 點 Run workflow 立即測試)。</div>`
+      : `<div class="banner">目前超過 90 秒未收到回報。若已關掉家裡電腦,下次 GitHub Actions 排程執行後會自動接手。</div>`;
+  }
+  if (st.config.buy.enabled && st.config.buy.live) w += `<div class="banner bad">本機自動下單:正式送出模式</div>`;
   $("#warnings").innerHTML = w;
 
-  // 電腦偵測程式
-  const pl = st.poller;
+  // 偵測引擎
   const buy = st.config.buy;
-  const buyInfo = !buy.enabled
-    ? "自動下單:關閉"
-    : pl?.buyer
-      ? `自動下單:就緒(${buy.live ? "正式" : "演練"},關鍵字 ${buy.keywords.length ? esc(buy.keywords.join("、")) : "未設定"})`
-      : `自動下單:未就緒${pl?.buyerMsg ? " · " + esc(pl.buyerMsg) : ""}`;
+  const runnerTitle = pl
+    ? `${esc(pl.runner)} · ${st.pollerOnline ? "運作正常" : "等待下次執行"}`
+    : "尚未收到回報";
+  const modeInfo = isCron
+    ? "模式:雲端排程(每 5～15 分鐘自動掃描,電腦不用開機)"
+    : !buy.enabled
+      ? "模式:本機常駐(僅通知,自動下單關閉)"
+      : pl?.buyer
+        ? `本機自動下單:就緒(${buy.live ? "正式" : "演練"},關鍵字 ${buy.keywords.length ? esc(buy.keywords.join("、")) : "未設定"})`
+        : `本機自動下單:未就緒${pl?.buyerMsg ? " · " + esc(pl.buyerMsg) : ""}`;
   $("#poller").innerHTML = `<div class="card src"><span class="dot ${st.pollerOnline ? "ok" : "bad"}"></span>
-    <div><div class="name">${st.pollerOnline ? "上線中" : "離線"}</div>
-    <div class="info">${pl ? `最後回報 ${ago(pl.at, st.now)}` : "從未回報"}</div>
-    <div class="info">${buyInfo}</div></div></div>`;
+    <div><div class="name">${runnerTitle}</div>
+    <div class="info">${pl ? `最後掃描 ${ago(pl.at, st.now)}` : "從未回報"}</div>
+    <div class="info">${modeInfo}</div></div></div>`;
 
   // 下單紀錄
   const stateText = { sent: "處理中", ok: "✅ 已下單", dry: "🧪 演練完成", fail: "❌ 失敗" };
@@ -296,7 +306,7 @@ $("#watchForm").onsubmit = (e) => {
   run(e.submitter || $("#watchForm button"), async () => {
     const r = await api("/watch", "POST", { input });
     $("#watchInput").value = "";
-    toast(`已加入追蹤:${r.slug},電腦下次回報時檢查`);
+    toast(`已加入追蹤:${r.slug},下次掃描時檢查`);
     await refresh();
   });
 };

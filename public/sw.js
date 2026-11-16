@@ -1,5 +1,5 @@
 // 只快取 App 外殼,讓 PWA 開啟更快;/api 永遠走網路,不快取。
-const CACHE = "funbox-shell-v2";
+const CACHE = "funbox-shell-v3";
 const SHELL = ["/", "/style.css", "/app.js", "/manifest.webmanifest"];
 
 self.addEventListener("install", (e) => {

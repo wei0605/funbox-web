@@ -11,7 +11,8 @@ const MAX_KNOWN = 5000;
 const MAX_DONE = 500;
 const MAX_NEED = 15; // 每次回報最多要求抓幾個新商品頁
 const MAX_PENDING = 15; // 每次最多檢查幾個追蹤中的商品
-const POLLER_STALE_MS = 90_000; // 超過這麼久沒回報就視為離線
+const POLLER_STALE_LOOP_MS = 90_000; // 本機常駐超過 90 秒沒回報視為離線
+const POLLER_STALE_CRON_MS = 25 * 60_000; // GitHub Actions 排程可能延遲,超過 25 分鐘沒回報視為逾時
 const STAGE_ORDER = { url: 0, listed: 1, stock: 2 };
 
 const json = (data, status = 200) =>
@@ -86,8 +87,12 @@ export class Monitor extends DurableObject {
     this.dirty = true;
   }
 
+  pollerStaleMs(p = this.s.poller) {
+    return p?.mode === "cron" ? POLLER_STALE_CRON_MS : POLLER_STALE_LOOP_MS;
+  }
+
   pollerOnline() {
-    return !!this.s.poller && Date.now() - this.s.poller.at < POLLER_STALE_MS;
+    return !!this.s.poller && Date.now() - this.s.poller.at < this.pollerStaleMs();
   }
 
   // ---------------------------------------------------------------- 通知
@@ -306,9 +311,12 @@ export class Monitor extends DurableObject {
   async report(b) {
     const buys = [];
     const prev = this.s.poller;
+    const mode = b.mode === "cron" ? "cron" : "loop";
     const buyer = b.buyer && typeof b.buyer === "object" ? { ok: !!b.buyer.ok, msg: str(b.buyer.msg, 200) } : null;
-    this.s.poller = { at: Date.now(), runner: str(b.runner, 80), buyer: buyer?.ok ? true : false, buyerMsg: buyer?.msg || "" };
-    if (!prev || Date.now() - prev.at > POLLER_STALE_MS) this.log("info", `電腦偵測程式已連線(${this.s.poller.runner})`);
+    const runner = str(b.runner, 80) || (mode === "cron" ? "GitHub Actions" : "偵測程式");
+    const wasStale = !prev || Date.now() - prev.at > this.pollerStaleMs(prev);
+    this.s.poller = { at: Date.now(), runner, mode, buyer: buyer?.ok ? true : false, buyerMsg: buyer?.msg || "" };
+    if (wasStale || prev?.runner !== runner) this.log("info", `偵測程式已連線(${runner})`);
     this.dirty = true;
 
     for (const n of arr(b.notices).slice(0, 5)) await this.notify("⚠ 電腦下單程式", str(n, 400), "warn");
@@ -394,7 +402,7 @@ export class Monitor extends DurableObject {
       this.done.delete(slug);
       delete this.s.announced[slug];
       this.track(slug, true);
-      this.log("info", `手動加入追蹤:${slug}(電腦下次回報時檢查)`);
+      this.log("info", `手動加入追蹤:${slug}(下次掃描時檢查)`);
       await this.save();
       return json({ ok: true, slug });
     }
